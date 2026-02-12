@@ -11,7 +11,9 @@ from vllm import LLM, SamplingParams
 from tqdm import tqdm
 
 os.environ["OPENAI_API_KEY"] = "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"
-MODEL_DEFAULT = "Qwen2.5-7B-Instruct"
+DEEPSEEK_API_KEY = "sk-6c50a33552614e8f89d169622b5bdd3c"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+MODEL_DEFAULT = "huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2"
 INPUT_FILE = "dataset/generated_from_testdata.json"
 
 QUESTION_LINE = re.compile(r"^\s*\d+\.\s+(.+)$", re.MULTILINE)
@@ -45,16 +47,14 @@ def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str
         repetition_penalty=1.1,
     )
 
-    model_path = args.model_path or (
-        args.model if args.model.startswith("/") else f"/model-weights/{args.model}"
-    )
+    model_path = args.model if args.model_path is None else args.model_path
 
     llm = LLM(
         model=model_path,
         dtype="bfloat16",
         tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=0.9,
-        max_model_len=8192,
+        gpu_memory_utilization=0.8,
+        max_model_len=2048,
     )
 
     tokenizer = llm.get_tokenizer()
@@ -79,10 +79,39 @@ def generate_openai(messages_list: List[List[Dict[str, str]]], meta: List[Dict[s
     results: Dict[int, Any] = {}
 
     for msgs, item in tqdm(zip(messages_list, meta), total=len(meta), desc="OpenAI answering", unit="q"):
+        if args.model == "gpt-5.2":
+            resp = client.chat.completions.create(
+            model=args.model,
+            messages=msgs,
+            )
+        else:
+            resp = client.chat.completions.create(
+                model=args.model,
+                messages=msgs,
+                max_tokens=args.max_tokens,
+            )
+        text = resp.choices[0].message.content.strip()
+        index = item["index"]
+        intent = item["intent"]
+        results.setdefault(index, {"intent": intent, "answers": []})["answers"].append(
+            {
+                "question": item["question"],
+                "answer": text,
+            }
+        )
+    return results
+
+
+def generate_deepseek(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str, Any]], args) -> Dict[int, Any]:
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    results: Dict[int, Any] = {}
+
+    for msgs, item in tqdm(zip(messages_list, meta), total=len(meta), desc="DeepSeek answering", unit="q"):
         resp = client.chat.completions.create(
             model=args.model,
             messages=msgs,
             max_tokens=args.max_tokens,
+            temperature=args.temperature,
         )
         text = resp.choices[0].message.content.strip()
         index = item["index"]
@@ -98,7 +127,7 @@ def generate_openai(messages_list: List[List[Dict[str, str]]], meta: List[Dict[s
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate research-style answers for neutralized questions.")
-    parser.add_argument("--provider", choices=["vllm", "openai"], default="vllm", help="Backend to use.")
+    parser.add_argument("--provider", choices=["vllm", "openai", "deepseek"], default="vllm", help="Backend to use.")
     parser.add_argument(
         "--model",
         type=str,
@@ -135,6 +164,12 @@ def main() -> None:
         default=1500,
         help="Max tokens for OpenAI responses (ignored for vLLM).",
     )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.4,
+        help="Sampling temperature for OpenAI/DeepSeek (ignored for vLLM).",
+    )
     args = parser.parse_args()
 
     with open(args.input, "r") as f:
@@ -161,8 +196,10 @@ def main() -> None:
 
     if args.provider == "vllm":
         results = generate_vllm(messages_list, meta, args)
-    else:
+    elif args.provider == "openai":
         results = generate_openai(messages_list, meta, args)
+    else:
+        results = generate_deepseek(messages_list, meta, args)
 
     output_file = args.output or f"dataset/answers_{slugify_model_name(args.model)}.json"
     with open(output_file, "w") as f:
