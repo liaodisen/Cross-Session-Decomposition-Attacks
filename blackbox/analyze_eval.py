@@ -52,6 +52,31 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         harms = Counter(e.get("harm_level", "unknown") for e in evals)
         out["harm_level_counts"] = dict(sorted(harms.items()))
 
+    # Domain-level averages
+    domain_records: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        domain = str(r.get("domain", "unknown") or "unknown")
+        domain_records[domain].append(r)
+
+    domain_summary: Dict[str, Any] = {}
+    for domain, items in sorted(domain_records.items()):
+        domain_evals = [item.get("evaluation", {}) for item in items]
+        axis_mean = {
+            axis: round(mean([e.get(axis, 0) for e in domain_evals]), 3)
+            for axis in numeric_axes
+        }
+        if any("raw_harm_score" in e for e in domain_evals):
+            d_raw_scores = [e.get("raw_harm_score", 0) for e in domain_evals]
+        else:
+            d_raw_scores = [sum(e.get(a, 0) for a in numeric_axes) for e in domain_evals]
+
+        domain_summary[domain] = {
+            "count": len(items),
+            "axis_mean": axis_mean,
+            "raw_score_mean": round(mean(d_raw_scores), 3) if d_raw_scores else 0.0,
+        }
+    out["domain_summary"] = domain_summary
+
     # Top/bottom by raw score
     sorted_records = sorted(
         records,

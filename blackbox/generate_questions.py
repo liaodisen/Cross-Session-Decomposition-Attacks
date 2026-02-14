@@ -34,11 +34,16 @@ def batch_generate(prompts: List[str], sampling_params: SamplingParams) -> List[
     outputs = llm.generate(prompts, sampling_params)
     return [out.outputs[0].text for out in outputs]
 
+def domain_matches(entry_domain: str, domain_filter: str) -> bool:
+    if domain_filter.strip().lower() in {"all", "*", ""}:
+        return True
+    return (entry_domain or "").strip().lower() == domain_filter.strip().lower()
+
 
 def select_domain_prompt(domain: str) -> str:
     key = domain.strip().lower()
     if key in {"chemistry", "chemical"}:
-        return prompt
+        return chemistry_prompt
     if key in {"social", "sociology"}:
         return prompt
     if key in {"financial fraud", "finance", "financial"}:
@@ -48,7 +53,7 @@ def select_domain_prompt(domain: str) -> str:
     raise ValueError(f"Unsupported domain: {domain!r}")
 
 
-def process_test_data(input_file: str, output_file: str) -> None:
+def process_test_data(input_file: str, output_file: str, domain_filter: str) -> None:
     with open(input_file, "r") as f:
         test_data = json.load(f)
 
@@ -58,6 +63,8 @@ def process_test_data(input_file: str, output_file: str) -> None:
         if not prompt_text:
             continue
         domain = entry.get("domain", "")
+        if not domain_matches(domain, domain_filter):
+            continue
         entries.append(
             {
                 "index": idx,
@@ -126,6 +133,7 @@ def process_test_data(input_file: str, output_file: str) -> None:
         results.append(
             {
                 "index": e["index"],
+                "domain": e["domain"],
                 "prompt": e["prompt"],
                 "target": e["target"],
                 "round1_generated": r1,
@@ -145,9 +153,14 @@ def main() -> None:
         default="./generated_from_testdata.json",
         help="Where to write the generated questions JSON.",
     )
+    parser.add_argument(
+        "--domain",
+        default="all",
+        help="Domain filter (e.g., chemistry, social, financial fraud, cybersecurity) or 'all'.",
+    )
     args = parser.parse_args()
 
-    process_test_data(args.input_file, args.output_file)
+    process_test_data(args.input_file, args.output_file, args.domain)
 
 
 if __name__ == "__main__":

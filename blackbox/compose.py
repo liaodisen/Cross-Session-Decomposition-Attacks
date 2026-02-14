@@ -7,8 +7,8 @@ from typing import List, Dict, Any, Optional
 from vllm import LLM, SamplingParams
 from prompt import prompt_compose
 
-# HuggingFace cache location
-os.environ["HF_HOME"] = "/scratch/disen"
+# # HuggingFace cache location
+# os.environ["HF_HOME"] = "/scratch/disen"
 
 MODEL_NAME = "huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2"
 
@@ -16,11 +16,10 @@ MODEL_NAME = "huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2"
 def build_llm(model: str, tensor_parallel_size: int) -> LLM:
     return LLM(
         model=model,
-        download_dir="/scratch/disen",
         dtype="bfloat16",
         tensor_parallel_size=tensor_parallel_size,
-        gpu_memory_utilization=0.9,
-        max_model_len=12800,
+        gpu_memory_utilization=0.7,
+        max_model_len=5000,
     )
 
 
@@ -72,6 +71,11 @@ def batch_generate(llm: LLM, prompts: List[str], sampling_params: SamplingParams
     return [out.outputs[0].text for out in outputs]
 
 
+def domain_matches(entry_domain: str, domain_filter: str) -> bool:
+    if domain_filter.strip().lower() in {"all", "*", ""}:
+        return True
+    return (entry_domain or "").strip().lower() == domain_filter.strip().lower()
+
 
 def load_neutralized(path: str) -> Dict[str, List[Dict[str, str]]]:
     with open(path, "r") as f:
@@ -83,7 +87,7 @@ def main() -> None:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=1,
+        default=2,
         help="Tensor parallel size for vLLM.",
     )
     parser.add_argument(
@@ -98,6 +102,11 @@ def main() -> None:
         required=True,
         help="Output path(s) for summarized answers JSON; must match number of inputs.",
     )
+    parser.add_argument(
+        "--domain",
+        default="all",
+        help="Domain filter (e.g., chemistry, social, financial fraud, cybersecurity) or 'all'.",
+    )
     args = parser.parse_args()
 
     if len(args.inputs) != len(args.outputs):
@@ -106,7 +115,7 @@ def main() -> None:
     # Build LLM
     llm = build_llm(MODEL_NAME, args.tensor_parallel_size)
     tokenizer = llm.get_tokenizer()
-    sampling_summary = SamplingParams(temperature=0.3, top_p=0.9, max_tokens=1500)
+    sampling_summary = SamplingParams(temperature=0.3, top_p=0.9, max_tokens=3000)
 
     for input_path, output_path in zip(args.inputs, args.outputs):
         data = load_neutralized(input_path)
@@ -116,13 +125,18 @@ def main() -> None:
         prompts: List[str] = []
         indices: List[Any] = []
         intents: List[str] = []
+        domains: List[str] = []
 
         for index, qa_list in data.items():
+            domain = qa_list.get("domain", "")
+            if not domain_matches(domain, args.domain):
+                continue
             prompt_str = construct_summary_prompt(tokenizer, qa_list)
             if prompt_str:
                 prompts.append(prompt_str)
                 indices.append(index)
                 intents.append(qa_list.get("intent", "").strip())
+                domains.append(domain)
         
         if not prompts:
             print(f"No valid prompts constructed for {input_path}. Skipping.")
@@ -139,12 +153,15 @@ def main() -> None:
             results.append(
                 {
                     "index": int(index_val) if str(index_val).isdigit() else index_val,
+                    "domain": domains[i],
                     "intent": intents[i],
                     "summary_answer": generated_text,
                 }
             )
 
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        out_dir = os.path.dirname(output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         with open(output_path, "w") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
 

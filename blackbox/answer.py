@@ -38,6 +38,11 @@ def to_chat_prompt(tokenizer, messages: List[Dict[str, str]]) -> str:
         add_generation_prompt=True,
     )
 
+def domain_matches(entry_domain: str, domain_filter: str) -> bool:
+    if domain_filter.strip().lower() in {"all", "*", ""}:
+        return True
+    return (entry_domain or "").strip().lower() == domain_filter.strip().lower()
+
 
 def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str, Any]], args) -> Dict[int, Any]:
     sampling_params = SamplingParams(
@@ -65,7 +70,8 @@ def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str
     for item, out in zip(meta, outputs):
         index = item["index"]
         intent = item["intent"]
-        results.setdefault(index, {"intent": intent, "answers": []})["answers"].append(
+        domain = item.get("domain", "")
+        results.setdefault(index, {"intent": intent, "domain": domain, "answers": []})["answers"].append(
             {
                 "question": item["question"],
                 "answer": out.outputs[0].text.strip(),
@@ -93,7 +99,8 @@ def generate_openai(messages_list: List[List[Dict[str, str]]], meta: List[Dict[s
         text = resp.choices[0].message.content.strip()
         index = item["index"]
         intent = item["intent"]
-        results.setdefault(index, {"intent": intent, "answers": []})["answers"].append(
+        domain = item.get("domain", "")
+        results.setdefault(index, {"intent": intent, "domain": domain, "answers": []})["answers"].append(
             {
                 "question": item["question"],
                 "answer": text,
@@ -116,7 +123,8 @@ def generate_deepseek(messages_list: List[List[Dict[str, str]]], meta: List[Dict
         text = resp.choices[0].message.content.strip()
         index = item["index"]
         intent = item["intent"]
-        results.setdefault(index, {"intent": intent, "answers": []})["answers"].append(
+        domain = item.get("domain", "")
+        results.setdefault(index, {"intent": intent, "domain": domain, "answers": []})["answers"].append(
             {
                 "question": item["question"],
                 "answer": text,
@@ -170,6 +178,12 @@ def main() -> None:
         default=0.4,
         help="Sampling temperature for OpenAI/DeepSeek (ignored for vLLM).",
     )
+    parser.add_argument(
+        "--domain",
+        type=str,
+        default="all",
+        help="Domain filter (e.g., chemistry, social, financial fraud, cybersecurity) or 'all'.",
+    )
     args = parser.parse_args()
 
     with open(args.input, "r") as f:
@@ -184,6 +198,9 @@ def main() -> None:
     )
 
     for item in data:
+        domain = item.get("domain", "")
+        if not domain_matches(domain, args.domain):
+            continue
         intent = item.get("prompt", "").strip()
         block = item.get("round2_neutralized", "").strip()
         for q in split_numbered(block):
@@ -192,7 +209,7 @@ def main() -> None:
                 {"role": "user", "content": q},
             ]
             messages_list.append(messages)
-            meta.append({"index": item.get("index"), "question": q, "intent": intent})
+            meta.append({"index": item.get("index"), "question": q, "intent": intent, "domain": domain})
 
     if args.provider == "vllm":
         results = generate_vllm(messages_list, meta, args)
