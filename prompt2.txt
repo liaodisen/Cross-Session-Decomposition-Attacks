@@ -1,0 +1,4 @@
+Give me some areas where knowledge can be used for harmful intents:
+Example:
+Chemistry -> Make explosive device using household items.
+Finance -> Commit insurance fraud and get away with it
