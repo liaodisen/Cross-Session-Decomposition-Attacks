@@ -1,0 +1,11 @@
+# results
+intermediate_results/
+
+# __pycache__
+__pycache__/
+
+# results
+results/
+
+# log
+logs/
