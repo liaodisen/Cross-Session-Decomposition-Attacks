@@ -1,16 +1,19 @@
 import argparse
 import json
 import os
+
+os.environ["HF_HOME"] = "/scratch/disen"
+os.environ["HUGGINGFACE_HUB_CACHE"] = "/scratch/disen/hub"
+
 from typing import List, Dict
 from vllm import LLM, SamplingParams
 from prompt import chemistry_prompt, social_prompt, financial_prompt, cybersecurity_prompt, prompt
-
 # ------------------ vLLM Setup ------------------
 llm = LLM(
     model="huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2",
     dtype="bfloat16",
-    tensor_parallel_size=2,
-    gpu_memory_utilization=0.95,
+    tensor_parallel_size=1,
+    gpu_memory_utilization=0.9,
     max_model_len=12800,
     enforce_eager=True,
 )
@@ -43,12 +46,14 @@ def domain_matches(entry_domain: str, domain_filter: str) -> bool:
 def select_domain_prompt(domain: str) -> str:
     key = domain.strip().lower()
     if key in {"chemistry", "chemical"}:
-        return chemistry_prompt
+        return prompt
     if key in {"social", "sociology"}:
         return prompt
     if key in {"financial fraud", "finance", "financial"}:
         return prompt
     if key in {"cybersecurity", "cyber", "security"}:
+        return prompt
+    else:
         return prompt
     raise ValueError(f"Unsupported domain: {domain!r}")
 

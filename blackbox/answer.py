@@ -10,7 +10,7 @@ from openai import OpenAI
 from vllm import LLM, SamplingParams
 from tqdm import tqdm
 
-os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = "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"
 DEEPSEEK_API_KEY = "sk-6c50a33552614e8f89d169622b5bdd3c"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 MODEL_DEFAULT = "huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2"
@@ -31,12 +31,25 @@ def slugify_model_name(model_name: str) -> str:
     return safe or "model"
 
 
-def to_chat_prompt(tokenizer, messages: List[Dict[str, str]]) -> str:
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+def is_qwen_thinking_model(model_name: str) -> bool:
+    normalized = (model_name or "").strip().lower()
+    return "qwen3" in normalized or "qwq" in normalized
+
+
+def to_chat_prompt(tokenizer, messages: List[Dict[str, str]], model_name: str = "") -> str:
+    apply_kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    tokenizer_name = getattr(tokenizer, "name_or_path", "")
+    if is_qwen_thinking_model(model_name) or is_qwen_thinking_model(tokenizer_name):
+        apply_kwargs["enable_thinking"] = False
+
+    try:
+        return tokenizer.apply_chat_template(messages, **apply_kwargs)
+    except TypeError:
+        apply_kwargs.pop("enable_thinking", None)
+        return tokenizer.apply_chat_template(messages, **apply_kwargs)
 
 def domain_matches(entry_domain: str, domain_filter: str) -> bool:
     if domain_filter.strip().lower() in {"all", "*", ""}:
@@ -48,7 +61,7 @@ def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str
     sampling_params = SamplingParams(
         temperature=0.4,
         top_p=0.9,
-        max_tokens=1500,
+        max_tokens=args.max_tokens,
         repetition_penalty=1.1,
     )
 
@@ -58,12 +71,12 @@ def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str
         model=model_path,
         dtype="bfloat16",
         tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=0.8,
-        max_model_len=2048,
+        gpu_memory_utilization=0.9,
+        max_model_len=10000,
     )
 
     tokenizer = llm.get_tokenizer()
-    prompts = [to_chat_prompt(tokenizer, m) for m in messages_list]
+    prompts = [to_chat_prompt(tokenizer, m, model_path) for m in messages_list]
     outputs = llm.generate(prompts, sampling_params)
 
     results: Dict[int, Any] = {}

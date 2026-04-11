@@ -3,14 +3,17 @@
 import argparse
 import json
 import os
+
+# # HuggingFace cache location
+os.environ["HF_HOME"] = "/scratch/disen"
+os.environ["HUGGINGFACE_HUB_CACHE"] = "/scratch/disen/hub"
+MODEL_NAME = "huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2"
+
+
 from typing import List, Dict, Any, Optional
 from vllm import LLM, SamplingParams
 from prompt import prompt_compose
 
-# # HuggingFace cache location
-# os.environ["HF_HOME"] = "/scratch/disen"
-
-MODEL_NAME = "huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2"
 
 
 def build_llm(model: str, tensor_parallel_size: int) -> LLM:
@@ -18,8 +21,8 @@ def build_llm(model: str, tensor_parallel_size: int) -> LLM:
         model=model,
         dtype="bfloat16",
         tensor_parallel_size=tensor_parallel_size,
-        gpu_memory_utilization=0.7,
-        max_model_len=5000,
+        gpu_memory_utilization=0.9,
+        max_model_len=10000,
     )
 
 
@@ -115,7 +118,7 @@ def main() -> None:
     # Build LLM
     llm = build_llm(MODEL_NAME, args.tensor_parallel_size)
     tokenizer = llm.get_tokenizer()
-    sampling_summary = SamplingParams(temperature=0.3, top_p=0.9, max_tokens=3000)
+    sampling_summary = SamplingParams(temperature=0.3, top_p=0.9, max_tokens=5000)
 
     for input_path, output_path in zip(args.inputs, args.outputs):
         data = load_neutralized(input_path)
