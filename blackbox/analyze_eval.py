@@ -5,7 +5,7 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import mean
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 def load(path: Path) -> List[Dict[str, Any]]:
@@ -15,92 +15,138 @@ def load(path: Path) -> List[Dict[str, Any]]:
     return data
 
 
+def _to_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            return int(s)
+    return None
+
+
+def _to_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"true", "1", "yes", "y"}:
+            return True
+        if s in {"false", "0", "no", "n"}:
+            return False
+    return None
+
+
+def _extract_category(evaluation: Dict[str, Any]) -> Optional[int]:
+    # Primary key in new schema
+    c = _to_int(evaluation.get("category"))
+    if c is not None:
+        return c
+
+    # Backward-compatible fallbacks if needed
+    for k in ["harm_category", "score", "raw_harm_score"]:
+        v = _to_int(evaluation.get(k))
+        if v is not None:
+            return v
+    return None
+
+
+def _extract_very_harmful(evaluation: Dict[str, Any], category: Optional[int]) -> bool:
+    vh = _to_bool(evaluation.get("very_harmful"))
+    if vh is not None:
+        return vh
+    # Sensible fallback if boolean missing
+    return (category is not None) and (category >= 4)
+
+
 def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    evals = [r.get("evaluation", {}) for r in records]
     out: Dict[str, Any] = {}
+    out["total"] = len(records)
 
-    # Counts
-    out["total"] = len(evals)
+    parsed: List[Dict[str, Any]] = []
+    category_counter: Counter = Counter()
+    very_harmful_count = 0
 
-    # Detect numeric axes dynamically (exclude raw/harm_level)
-    candidate_keys = set().union(*(e.keys() for e in evals))
-    numeric_axes = []
-    for k in sorted(candidate_keys):
-        if k in {"raw_harm_score", "harm_level", "rationale"}:
-            continue
-        values = [e.get(k) for e in evals]
-        if all(isinstance(v, (int, float)) for v in values if v is not None):
-            numeric_axes.append(k)
+    for r in records:
+        e = r.get("evaluation", {})
+        if not isinstance(e, dict):
+            e = {}
 
-    out["axes"] = numeric_axes
-    out["axis_mean"] = {axis: round(mean([e.get(axis, 0) for e in evals]), 3) for axis in numeric_axes}
+        category = _extract_category(e)
+        very_harmful = _extract_very_harmful(e, category)
 
-    # Raw score stats (fallback to summed axes if raw_harm_score missing)
-    if any("raw_harm_score" in e for e in evals):
-        raw_scores = [e.get("raw_harm_score", 0) for e in evals]
-    else:
-        raw_scores = [sum(e.get(a, 0) for a in numeric_axes) for e in evals]
+        if category is None:
+            category_counter["unknown"] += 1
+        else:
+            category_counter[category] += 1
 
-    out["raw_score"] = {
-        "mean": round(mean(raw_scores), 3),
-        "min": min(raw_scores),
-        "max": max(raw_scores),
+        if very_harmful:
+            very_harmful_count += 1
+
+        parsed.append(
+            {
+                "id": r.get("id"),
+                "intent": r.get("intent"),
+                "domain": str(r.get("domain", "unknown") or "unknown"),
+                "category": category,
+                "very_harmful": very_harmful,
+                "rationale": e.get("rationale"),
+            }
+        )
+
+    out["category_counts"] = dict(sorted(category_counter.items(), key=lambda kv: str(kv[0])))
+
+    numeric_categories = [p["category"] for p in parsed if isinstance(p["category"], int)]
+    out["category_mean"] = round(mean(numeric_categories), 3) if numeric_categories else None
+    out["category_min"] = min(numeric_categories) if numeric_categories else None
+    out["category_max"] = max(numeric_categories) if numeric_categories else None
+
+    out["very_harmful"] = {
+        "count": very_harmful_count,
+        "rate": round(very_harmful_count / len(records), 4) if records else 0.0,
     }
 
-    # Harm level distribution if present
-    if any("harm_level" in e for e in evals):
-        harms = Counter(e.get("harm_level", "unknown") for e in evals)
-        out["harm_level_counts"] = dict(sorted(harms.items()))
-
-    # Domain-level averages
-    domain_records: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for r in records:
-        domain = str(r.get("domain", "unknown") or "unknown")
-        domain_records[domain].append(r)
+    # Domain-level summary
+    domain_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for p in parsed:
+        domain_groups[p["domain"]].append(p)
 
     domain_summary: Dict[str, Any] = {}
-    for domain, items in sorted(domain_records.items()):
-        domain_evals = [item.get("evaluation", {}) for item in items]
-        axis_mean = {
-            axis: round(mean([e.get(axis, 0) for e in domain_evals]), 3)
-            for axis in numeric_axes
-        }
-        if any("raw_harm_score" in e for e in domain_evals):
-            d_raw_scores = [e.get("raw_harm_score", 0) for e in domain_evals]
-        else:
-            d_raw_scores = [sum(e.get(a, 0) for a in numeric_axes) for e in domain_evals]
+    for domain, items in sorted(domain_groups.items()):
+        cats = [x["category"] for x in items if isinstance(x["category"], int)]
+        vh_cnt = sum(1 for x in items if x["very_harmful"])
+        d_counter: Counter = Counter(
+            x["category"] if isinstance(x["category"], int) else "unknown"
+            for x in items
+        )
 
         domain_summary[domain] = {
             "count": len(items),
-            "axis_mean": axis_mean,
-            "raw_score_mean": round(mean(d_raw_scores), 3) if d_raw_scores else 0.0,
+            "category_mean": round(mean(cats), 3) if cats else None,
+            "very_harmful_rate": round(vh_cnt / len(items), 4) if items else 0.0,
+            "category_counts": dict(sorted(d_counter.items(), key=lambda kv: str(kv[0]))),
         }
+
     out["domain_summary"] = domain_summary
 
-    # Top/bottom by raw score
-    sorted_records = sorted(
-        records,
-        key=lambda r: r.get("evaluation", {}).get("raw_harm_score", sum(r.get("evaluation", {}).get(a, 0) for a in numeric_axes)),
+    # Ranking by risk: higher category first, then very_harmful
+    ranked = sorted(
+        parsed,
+        key=lambda x: (
+            x["category"] if isinstance(x["category"], int) else -1,
+            1 if x["very_harmful"] else 0,
+        ),
         reverse=True,
     )
-    out["top5"] = [
-        {
-            "id": r.get("id"),
-            "intent": r.get("intent"),
-            "raw_harm_score": r.get("evaluation", {}).get("raw_harm_score", None),
-            "harm_level": r.get("evaluation", {}).get("harm_level", None),
-        }
-        for r in sorted_records[:5]
-    ]
-    out["bottom5"] = [
-        {
-            "id": r.get("id"),
-            "intent": r.get("intent"),
-            "raw_harm_score": r.get("evaluation", {}).get("raw_harm_score", None),
-            "harm_level": r.get("evaluation", {}).get("harm_level", None),
-        }
-        for r in sorted_records[-5:]
-    ]
+
+    out["top5"] = ranked[:5]
+    out["bottom5"] = list(reversed(ranked[-5:]))
 
     return out
 
