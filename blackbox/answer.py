@@ -4,13 +4,14 @@ import argparse
 import json
 import re
 import os
+import sys
 from typing import Any, Dict, List
 
 from openai import OpenAI
 from vllm import LLM, SamplingParams
 from tqdm import tqdm
 
-os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = "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"
 DEEPSEEK_API_KEY = "sk-6c50a33552614e8f89d169622b5bdd3c"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 MODEL_DEFAULT = "huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2"
@@ -44,11 +45,80 @@ def domain_matches(entry_domain: str, domain_filter: str) -> bool:
     return (entry_domain or "").strip().lower() == domain_filter.strip().lower()
 
 
+def save_results(path: str, results: Dict[int, Any]) -> None:
+    with open(path, "w") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+
+def sanitize_text(value: Any) -> str:
+    if value is None:
+        text = ""
+    elif isinstance(value, str):
+        text = value
+    else:
+        text = str(value)
+    # Replace characters that can corrupt JSON or UTF-8 request bodies.
+    return text.replace("\x00", " ").encode("utf-8", errors="replace").decode("utf-8")
+
+
+def sanitize_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    cleaned: List[Dict[str, str]] = []
+    for msg in messages:
+        role = sanitize_text(msg.get("role", "user")).strip().lower() or "user"
+        if role not in {"system", "user", "assistant", "developer"}:
+            role = "user"
+        cleaned.append(
+            {
+                "role": role,
+                "content": sanitize_text(msg.get("content", "")),
+            }
+        )
+    return cleaned
+
+
+def is_gpt5_model(model_name: str) -> bool:
+    return model_name.strip().lower().startswith("gpt-5")
+
+
+def extract_response_text(response: Any) -> str:
+    text = getattr(response, "output_text", "") or ""
+    if text:
+        return text.strip()
+
+    parts: List[str] = []
+    for item in getattr(response, "output", []) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", None) == "output_text":
+                parts.append(getattr(content, "text", ""))
+    return "".join(parts).strip()
+
+
+def request_openai_text(client: OpenAI, model_name: str, messages: List[Dict[str, str]], max_tokens: int) -> str:
+    if is_gpt5_model(model_name):
+        resp = client.responses.create(
+            model=model_name,
+            input=messages,
+            max_output_tokens=max_tokens,
+            store=False,
+        )
+        return extract_response_text(resp)
+
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_tokens=max_tokens,
+        store=False,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
 def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str, Any]], args) -> Dict[int, Any]:
     sampling_params = SamplingParams(
         temperature=0.4,
         top_p=0.9,
-        max_tokens=1500,
+        max_tokens=args.max_tokens,
         repetition_penalty=1.1,
     )
 
@@ -58,8 +128,8 @@ def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str
         model=model_path,
         dtype="bfloat16",
         tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=0.8,
-        max_model_len=2048,
+        gpu_memory_utilization=0.9,
+        max_model_len=10000,
     )
 
     tokenizer = llm.get_tokenizer()
@@ -80,32 +150,58 @@ def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str
     return results
 
 
-def generate_openai(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str, Any]], args) -> Dict[int, Any]:
+def generate_openai(
+    messages_list: List[List[Dict[str, str]]],
+    meta: List[Dict[str, Any]],
+    args,
+    checkpoint_path: str,
+) -> Dict[int, Any]:
     client = OpenAI()
     results: Dict[int, Any] = {}
 
-    for msgs, item in tqdm(zip(messages_list, meta), total=len(meta), desc="OpenAI answering", unit="q"):
-        if args.model == "gpt-5.2":
-            resp = client.chat.completions.create(
-            model=args.model,
-            messages=msgs,
-            )
-        else:
-            resp = client.chat.completions.create(
-                model=args.model,
-                messages=msgs,
-                max_tokens=args.max_tokens,
-            )
-        text = resp.choices[0].message.content.strip()
+    for idx, (msgs, item) in enumerate(
+        tqdm(zip(messages_list, meta), total=len(meta), desc="OpenAI answering", unit="q"),
+        start=1,
+    ):
+        clean_msgs = sanitize_messages(msgs)
+        text = ""
+        error_message = ""
+
+        for attempt in range(args.openai_retries + 1):
+            try:
+                text = request_openai_text(client, args.model, clean_msgs, args.max_tokens)
+                error_message = ""
+                break
+            except Exception as exc:
+                error_message = f"{type(exc).__name__}: {exc}"
+                if attempt < args.openai_retries:
+                    client = OpenAI()
+
         index = item["index"]
         intent = item["intent"]
         domain = item.get("domain", "")
+        answer_entry: Dict[str, Any] = {
+            "question": item["question"],
+            "answer": text,
+        }
+        if error_message:
+            answer_entry.update(
+                {
+                    "answer": "",
+                    "skipped": True,
+                    "error": error_message,
+                }
+            )
+            print(
+                f"[warn] Skipping failed OpenAI request for index={index} question={idx}: {error_message}",
+                file=sys.stderr,
+            )
+
         results.setdefault(index, {"intent": intent, "domain": domain, "answers": []})["answers"].append(
-            {
-                "question": item["question"],
-                "answer": text,
-            }
+            answer_entry
         )
+        if checkpoint_path and args.checkpoint_every > 0 and idx % args.checkpoint_every == 0:
+            save_results(checkpoint_path, results)
     return results
 
 
@@ -184,6 +280,18 @@ def main() -> None:
         default="all",
         help="Domain filter (e.g., chemistry, social, financial fraud, cybersecurity) or 'all'.",
     )
+    parser.add_argument(
+        "--openai-retries",
+        type=int,
+        default=2,
+        help="Number of retries for each OpenAI request before skipping that question.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=50,
+        help="Write partial results every N answered questions. Set to 0 to disable.",
+    )
     args = parser.parse_args()
 
     with open(args.input, "r") as f:
@@ -211,16 +319,16 @@ def main() -> None:
             messages_list.append(messages)
             meta.append({"index": item.get("index"), "question": q, "intent": intent, "domain": domain})
 
+    output_file = args.output or f"dataset/answers_{slugify_model_name(args.model)}.json"
+
     if args.provider == "vllm":
         results = generate_vllm(messages_list, meta, args)
     elif args.provider == "openai":
-        results = generate_openai(messages_list, meta, args)
+        results = generate_openai(messages_list, meta, args, checkpoint_path=output_file)
     else:
         results = generate_deepseek(messages_list, meta, args)
 
-    output_file = args.output or f"dataset/answers_{slugify_model_name(args.model)}.json"
-    with open(output_file, "w") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    save_results(output_file, results)
 
     print(f"Saved {len(results)} answers to {output_file}")
 

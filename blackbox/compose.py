@@ -18,8 +18,8 @@ def build_llm(model: str, tensor_parallel_size: int) -> LLM:
         model=model,
         dtype="bfloat16",
         tensor_parallel_size=tensor_parallel_size,
-        gpu_memory_utilization=0.7,
-        max_model_len=5000,
+        gpu_memory_utilization=0.9,
+        max_model_len=10000,
     )
 
 

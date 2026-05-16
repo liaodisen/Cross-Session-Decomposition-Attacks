@@ -50,6 +50,8 @@ def select_domain_prompt(domain: str) -> str:
         return prompt
     if key in {"cybersecurity", "cyber", "security"}:
         return prompt
+    else:
+        return prompt
     raise ValueError(f"Unsupported domain: {domain!r}")
 
 
