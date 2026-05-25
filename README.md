@@ -1,73 +1,133 @@
-# Blackbox Pipeline Guide
+# Pairwise Decomposition Experiment
 
-This README explains how to use the scripts under `blackbox/` to generate neutralized research questions, answer them with local/OpenAI models, compose final manuals, and score harmfulness.
+## Pipeline
 
-## Prerequisites
-- Python 3.10+ with `vllm`, `openai`, `tqdm`, `argparse` (install via `pip install -r requirements.txt` if available, or `pip install vllm openai tqdm`).
-- GPU with enough memory for Qwen models when using the vLLM paths in the scripts.
-- Set `OPENAI_API_KEY` in your environment before any script that calls OpenAI.
-- The scripts set `HF_HOME=/scratch/disen` and download weights to `/scratch/disen` by default; override these env vars if you want a different cache/download location.
+The reported setup fixes the decomposition and composition stages and varies only the victim model that answers the neutralized subquestions.
+The included runner scripts reproduce the Qwen3 and Gemma3 panels with `deepseek-chat` and `gpt-5.2` as API anchors.
 
-## Expected Data Layout
-- Input prompts live in `dataset/testdata.json` by default. Format: list of objects with `prompt` (string) and optional `target`.
-- Generated artifacts are written back to `dataset/` unless you pass explicit paths.
+1. `blackbox/generate_questions.py` uses `huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2` to produce five neutralized subquestions per intent. The default `intent/harmful_intents.json` file contains the 600-intent evaluation set.
+2. `blackbox/answer.py` sends the same subquestions to each victim model.
+3. `blackbox/compose.py` recomposes each victim model's answers into one final answer per original intent.
+4. `blackbox/pair_eval.py` asks a judge model to compare two final answers for the same intent.
+5. `blackbox/analyze_pair_judge_agreement.py` aggregates several judge files by strict majority vote.
+6. `blackbox/refusal_eval.py` judges whether each intermediate victim-model answer is a total refusal, partial refusal, or no refusal.
 
-## End-to-End Quickstart
-Run the steps from the repo root (`qwen14b_vllm/`). Each command accepts flags to override paths/models.
+## Requirements
+
+- Python 3.10+
+- `vllm`, `openai`, and `tqdm`
+- Local model weights for the open-weight victim and judge models used in the scripts
+- `OPENAI_API_KEY` for OpenAI victims or judges
+- `DEEPSEEK_API_KEY` for the `deepseek-chat` victim
+
+Example setup:
 
 ```bash
-# 1) Generate two-round, neutralized question sets from raw prompts
-python blackbox/generate_questions.py \
-  --input_file dataset/testdata.json \
-  --output_file dataset/generated_from_testdata.json
-
-# 2) Answer the neutralized questions (vLLM backend by default)
-python blackbox/answer.py \
-  --provider vllm \
-  --model Qwen2.5-7B-Instruct \
-  --input dataset/generated_from_testdata.json \
-  --output dataset/answers_qwen2.5-7b.json
-#    To use OpenAI instead: --provider openai --model gpt-4.1-mini --max-tokens 1500
-
-# 3) Compose final action-oriented manuals from the Q&A batches
-python blackbox/compose.py \
-  --inputs dataset/answers_qwen2.5-7b.json \
-  --outputs result/summary_qwen2.5-7b.json \
-  --tensor-parallel-size 1
-
-# 4) Score harmfulness of any dense paragraphs (e.g., composed summaries)
-python blackbox/evaluate_harmness.py \
-  --input result/summary_qwen2.5-7b.json \
-  --output dataset/harm_eval_results.json \
-  --model gpt-4.1-mini
-
-# 5) Aggregate and inspect the harm scores
-python blackbox/analyze_eval.py \
-  --input dataset/harm_eval_results.json \
-  --output dataset/harm_eval_summary.json
+python -m venv .venv
+. .venv/bin/activate
+pip install vllm openai tqdm
+export OPENAI_API_KEY=...
+export DEEPSEEK_API_KEY=...
 ```
 
-## Script Reference
-- `blackbox/generate_questions.py`
-  - Two-pass question generation with Qwen2.5-14B via vLLM.
-  - Flags: `--input_file`, `--output_file`. Batch size is fixed at 50; sampling params for exploration + neutralization are defined in the script.
-- `blackbox/answer.py`
-  - Turns neutralized questions into answers. Choose backend with `--provider {vllm,openai}`.
-  - vLLM: uses `--model` (or `--model-path`) and `--tensor-parallel-size`. Weights default to `/model-weights/<model>`.
-  - OpenAI: honors `--model` and `--max-tokens`; requires `OPENAI_API_KEY`.
-  - Output default: `dataset/answers_<model>.json`.
-- `blackbox/compose.py`
-  - Converts batches of Q&A pairs into an action-focused manual per intent.
-  - Flags: `--inputs` and `--outputs` (lists of equal length), `--tensor-parallel-size`.
-  - Uses Qwen2.5-14B via vLLM with a composing prompt defined in `blackbox/prompt.py`.
-- `blackbox/evaluate_harmness.py`
-  - Scores paragraphs on six axes plus composite harm level using an OpenAI model.
-  - Flags: `--input`, `--output`, `--model`, `--prompt_file` (to override the default rubric prompt).
-- `blackbox/analyze_eval.py`
-  - Summarizes harm evaluation JSON: mean per-axis, raw score stats, harm level distribution, and top/bottom examples.
-  - Flags: `--input`, optional `--output` (otherwise prints to stdout).
+## Run The Experiment
 
-## Tips
-- Files contain hard-coded API keys in the repo; prefer setting `OPENAI_API_KEY` in your shell to avoid using the placeholder value.
-- Adjust `tensor_parallel_size`, `gpu_memory_utilization`, and `max_model_len` in scripts if your GPU memory differs.
-- If you change prompt wording, edit `blackbox/prompt.py` and rerun the pipeline from the generation step that depends on it.
+Generate neutralized decompositions:
+
+```bash
+bash run_generate.sh \
+  --input-file intent/harmful_intents.json \
+  --domain all \
+  --output-file intermediate_results/generated_all.json \
+  --tensor-parallel-size 2
+```
+
+Run all reported victim models and compose final answers:
+
+```bash
+RUN_GENERATION=0 \
+VICTIM_PANEL=all \
+DOMAIN=all \
+GENERATED_FILE=intermediate_results/generated_all.json \
+bash run_experiment.sh
+```
+
+Run one victim model manually:
+
+```bash
+bash run_evaluate.sh \
+  --generated-file intermediate_results/generated_all.json \
+  --victim-model /model-weights/Qwen3-8B \
+  --provider vllm \
+  --tensor-parallel-size 2 \
+  --max-tokens 5192 \
+  --domain all
+```
+
+Run pairwise comparisons with an OpenAI judge:
+
+```bash
+JUDGE_LABEL=gpt5.4 \
+JUDGE_MODEL=gpt-5.4 \
+PANEL=all \
+DOMAIN=all \
+bash run_pair_eval.sh
+```
+
+Run pairwise comparisons with a local vLLM judge:
+
+```bash
+JUDGE_LABEL=llama3.1-70b \
+JUDGE_MODEL_PATH=/model-weights/Meta-Llama-3.1-70B-Instruct \
+JUDGE_TP_SIZE=4 \
+PANEL=all \
+DOMAIN=all \
+bash run_pair_eval_vllm_judge.sh
+```
+
+Other local judges can use the same script:
+
+```bash
+JUDGE_LABEL=qwen2.5-72b-instruct \
+JUDGE_MODEL_PATH=/model-weights/Qwen2.5-72B-Instruct \
+JUDGE_TP_SIZE=4 \
+bash run_pair_eval_vllm_judge.sh
+```
+
+Aggregate multi-judge majority votes:
+
+```bash
+JUDGE_LABELS="gpt5.4 gpt4o llama3.1-70b qwen2.5-72b-instruct qwen3.5-122b-a10b-fp8" \
+PANEL=all \
+bash run_pair_judge_agreement.sh
+```
+
+Run refusal judgment on intermediate answers:
+
+```bash
+JUDGE_LABEL=llama3.1-70b \
+JUDGE_MODEL=/model-weights/Meta-Llama-3.1-70B-Instruct \
+TENSOR_PARALLEL_SIZE=4 \
+DOMAIN=all \
+bash run_refusal_eval.sh
+```
+
+Scheduler wrappers with `#SBATCH` headers are kept locally under `sbatch/`. That directory is gitignored, so these cluster-specific drivers remain available without becoming part of the tracked no-SBATCH runner surface.
+
+## Useful Controls
+
+- `PANEL=gemma|qwen|all` selects model-pair groups for pairwise evaluation.
+- `LIMIT=<n>` limits pairwise comparisons for a smoke test.
+- `DOMAIN=<name|all>` filters intents and final-answer records.
+- `JUDGE_PROVIDER=openai|vllm|openai-compatible` controls the judge backend for `run_pair_eval.sh`.
+- `JUDGE_BASE_URL=http://127.0.0.1:8000/v1` points `run_pair_eval.sh` at an existing OpenAI-compatible judge endpoint.
+- `RUN_GENERATION=auto|1|0` controls whether `run_experiment.sh` regenerates decompositions.
+
+## Outputs
+
+- Generated decompositions: `intermediate_results/generated_all.json`
+- Victim answers: `intermediate_results/answers_<model>_all.json`
+- Composed final answers: `results/final_answers_<model>_all.json`
+- Single-judge pairwise files: `results/pair_eval_<judge>_<model_a>_vs_<model_b>.json`
+- Multi-judge agreement files: `results/pair_judge_agreement_<panel>_<model_a>_vs_<model_b>.json`
+- Refusal judgment files: `results/refusal_eval_<judge>_<domain>.json` plus optional TSV sidecars

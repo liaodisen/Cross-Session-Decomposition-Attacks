@@ -2,26 +2,31 @@
 
 import argparse
 import json
-import re
 import os
+import re
+import sys
 from typing import Any, Dict, List
 
 from openai import OpenAI
 from vllm import LLM, SamplingParams
 from tqdm import tqdm
 
-os.environ["OPENAI_API_KEY"] = "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"
-DEEPSEEK_API_KEY = "sk-6c50a33552614e8f89d169622b5bdd3c"
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 MODEL_DEFAULT = "huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2"
-INPUT_FILE = "dataset/generated_from_testdata.json"
+INPUT_FILE = "intermediate_results/generated_all.json"
 
-QUESTION_LINE = re.compile(r"^\s*\d+\.\s+(.+)$", re.MULTILINE)
+QUESTION_LINE = re.compile(r"^\s*(?:\d+[\.)]|[-*])\s*(.+?)\s*$", re.MULTILINE)
 
 
 def split_numbered(text: str) -> List[str]:
     qs = [m.group(1).strip() for m in QUESTION_LINE.finditer(text)]
-    return qs if qs else ([text.strip()] if text.strip() else [])
+    if qs:
+        return qs
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        return lines
+    return [text.strip()] if text.strip() else []
 
 
 def slugify_model_name(model_name: str) -> str:
@@ -51,10 +56,80 @@ def to_chat_prompt(tokenizer, messages: List[Dict[str, str]], model_name: str = 
         apply_kwargs.pop("enable_thinking", None)
         return tokenizer.apply_chat_template(messages, **apply_kwargs)
 
+
 def domain_matches(entry_domain: str, domain_filter: str) -> bool:
     if domain_filter.strip().lower() in {"all", "*", ""}:
         return True
     return (entry_domain or "").strip().lower() == domain_filter.strip().lower()
+
+
+def save_results(path: str, results: Dict[int, Any]) -> None:
+    with open(path, "w") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+
+def sanitize_text(value: Any) -> str:
+    if value is None:
+        text = ""
+    elif isinstance(value, str):
+        text = value
+    else:
+        text = str(value)
+    # Replace characters that can corrupt JSON or UTF-8 request bodies.
+    return text.replace("\x00", " ").encode("utf-8", errors="replace").decode("utf-8")
+
+
+def sanitize_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    cleaned: List[Dict[str, str]] = []
+    for msg in messages:
+        role = sanitize_text(msg.get("role", "user")).strip().lower() or "user"
+        if role not in {"system", "user", "assistant", "developer"}:
+            role = "user"
+        cleaned.append(
+            {
+                "role": role,
+                "content": sanitize_text(msg.get("content", "")),
+            }
+        )
+    return cleaned
+
+
+def is_gpt5_model(model_name: str) -> bool:
+    return model_name.strip().lower().startswith("gpt-5")
+
+
+def extract_response_text(response: Any) -> str:
+    text = getattr(response, "output_text", "") or ""
+    if text:
+        return text.strip()
+
+    parts: List[str] = []
+    for item in getattr(response, "output", []) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", None) == "output_text":
+                parts.append(getattr(content, "text", ""))
+    return "".join(parts).strip()
+
+
+def request_openai_text(client: OpenAI, model_name: str, messages: List[Dict[str, str]], max_tokens: int) -> str:
+    if is_gpt5_model(model_name):
+        resp = client.responses.create(
+            model=model_name,
+            input=messages,
+            max_output_tokens=max_tokens,
+            store=False,
+        )
+        return extract_response_text(resp)
+
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_tokens=max_tokens,
+        store=False,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str, Any]], args) -> Dict[int, Any]:
@@ -93,37 +168,69 @@ def generate_vllm(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str
     return results
 
 
-def generate_openai(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str, Any]], args) -> Dict[int, Any]:
+def generate_openai(
+    messages_list: List[List[Dict[str, str]]],
+    meta: List[Dict[str, Any]],
+    args,
+    checkpoint_path: str,
+) -> Dict[int, Any]:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise SystemExit("OPENAI_API_KEY environment variable is required for --provider openai")
     client = OpenAI()
     results: Dict[int, Any] = {}
 
-    for msgs, item in tqdm(zip(messages_list, meta), total=len(meta), desc="OpenAI answering", unit="q"):
-        if args.model == "gpt-5.2":
-            resp = client.chat.completions.create(
-            model=args.model,
-            messages=msgs,
-            )
-        else:
-            resp = client.chat.completions.create(
-                model=args.model,
-                messages=msgs,
-                max_tokens=args.max_tokens,
-            )
-        text = resp.choices[0].message.content.strip()
+    for idx, (msgs, item) in enumerate(
+        tqdm(zip(messages_list, meta), total=len(meta), desc="OpenAI answering", unit="q"),
+        start=1,
+    ):
+        clean_msgs = sanitize_messages(msgs)
+        text = ""
+        error_message = ""
+
+        for attempt in range(args.openai_retries + 1):
+            try:
+                text = request_openai_text(client, args.model, clean_msgs, args.max_tokens)
+                error_message = ""
+                break
+            except Exception as exc:
+                error_message = f"{type(exc).__name__}: {exc}"
+                if attempt < args.openai_retries:
+                    client = OpenAI()
+
         index = item["index"]
         intent = item["intent"]
         domain = item.get("domain", "")
+        answer_entry: Dict[str, Any] = {
+            "question": item["question"],
+            "answer": text,
+        }
+        if error_message:
+            answer_entry.update(
+                {
+                    "answer": "",
+                    "skipped": True,
+                    "error": error_message,
+                }
+            )
+            print(
+                f"[warn] Skipping failed OpenAI request for index={index} question={idx}: {error_message}",
+                file=sys.stderr,
+            )
+
         results.setdefault(index, {"intent": intent, "domain": domain, "answers": []})["answers"].append(
-            {
-                "question": item["question"],
-                "answer": text,
-            }
+            answer_entry
         )
+        if checkpoint_path and args.checkpoint_every > 0 and idx % args.checkpoint_every == 0:
+            save_results(checkpoint_path, results)
     return results
 
 
 def generate_deepseek(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str, Any]], args) -> Dict[int, Any]:
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise SystemExit("DEEPSEEK_API_KEY environment variable is required for --provider deepseek")
+
+    client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
     results: Dict[int, Any] = {}
 
     for msgs, item in tqdm(zip(messages_list, meta), total=len(meta), desc="DeepSeek answering", unit="q"):
@@ -159,7 +266,7 @@ def main() -> None:
         "--model-path",
         type=str,
         default=None,
-        help="Explicit model path for vLLM; overrides default /model-weights/<model>.",
+        help="Explicit model path for vLLM; overrides --model.",
     )
     parser.add_argument(
         "--output",
@@ -183,7 +290,7 @@ def main() -> None:
         "--max-tokens",
         type=int,
         default=1500,
-        help="Max tokens for OpenAI responses (ignored for vLLM).",
+        help="Maximum generated tokens for each victim-model answer.",
     )
     parser.add_argument(
         "--temperature",
@@ -196,6 +303,18 @@ def main() -> None:
         type=str,
         default="all",
         help="Domain filter (e.g., chemistry, social, financial fraud, cybersecurity) or 'all'.",
+    )
+    parser.add_argument(
+        "--openai-retries",
+        type=int,
+        default=2,
+        help="Number of retries for each OpenAI request before skipping that question.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=50,
+        help="Write partial results every N answered questions. Set to 0 to disable.",
     )
     args = parser.parse_args()
 
@@ -224,16 +343,16 @@ def main() -> None:
             messages_list.append(messages)
             meta.append({"index": item.get("index"), "question": q, "intent": intent, "domain": domain})
 
+    output_file = args.output or f"dataset/answers_{slugify_model_name(args.model)}.json"
+
     if args.provider == "vllm":
         results = generate_vllm(messages_list, meta, args)
     elif args.provider == "openai":
-        results = generate_openai(messages_list, meta, args)
+        results = generate_openai(messages_list, meta, args, checkpoint_path=output_file)
     else:
         results = generate_deepseek(messages_list, meta, args)
 
-    output_file = args.output or f"dataset/answers_{slugify_model_name(args.model)}.json"
-    with open(output_file, "w") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    save_results(output_file, results)
 
     print(f"Saved {len(results)} answers to {output_file}")
 
