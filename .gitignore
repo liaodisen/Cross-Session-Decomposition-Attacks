@@ -9,3 +9,6 @@ results/
 
 # log
 logs/
+
+# local scheduler wrappers
+sbatch/

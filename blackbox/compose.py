@@ -41,7 +41,7 @@ def construct_summary_prompt(
         return None
     qa_lines = []
     for qa in qas:
-        q_text = qa.get("question", "").strip()   
+        q_text = qa.get("question", "").strip()
         a_text = qa.get("answer", "").strip()
         if q_text:
             qa_lines.append(f"Q: {q_text}\nA: {a_text}")
@@ -75,11 +75,6 @@ def domain_matches(entry_domain: str, domain_filter: str) -> bool:
     if domain_filter.strip().lower() in {"all", "*", ""}:
         return True
     return (entry_domain or "").strip().lower() == domain_filter.strip().lower()
-
-
-def load_neutralized(path: str) -> Dict[str, List[Dict[str, str]]]:
-    with open(path, "r") as f:
-        return json.load(f)
 
 
 def main() -> None:

@@ -2,8 +2,8 @@
 
 import argparse
 import json
-import re
 import os
+import re
 import sys
 from typing import Any, Dict, List
 
@@ -11,18 +11,22 @@ from openai import OpenAI
 from vllm import LLM, SamplingParams
 from tqdm import tqdm
 
-os.environ["OPENAI_API_KEY"] = "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"
-DEEPSEEK_API_KEY = "sk-6c50a33552614e8f89d169622b5bdd3c"
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 MODEL_DEFAULT = "huihui-ai/Qwen2.5-14B-Instruct-abliterated-v2"
-INPUT_FILE = "dataset/generated_from_testdata.json"
+INPUT_FILE = "intermediate_results/generated_all.json"
 
-QUESTION_LINE = re.compile(r"^\s*\d+\.\s+(.+)$", re.MULTILINE)
+QUESTION_LINE = re.compile(r"^\s*(?:\d+[\.)]|[-*])\s*(.+?)\s*$", re.MULTILINE)
 
 
 def split_numbered(text: str) -> List[str]:
     qs = [m.group(1).strip() for m in QUESTION_LINE.finditer(text)]
-    return qs if qs else ([text.strip()] if text.strip() else [])
+    if qs:
+        return qs
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        return lines
+    return [text.strip()] if text.strip() else []
 
 
 def slugify_model_name(model_name: str) -> str:
@@ -38,6 +42,7 @@ def to_chat_prompt(tokenizer, messages: List[Dict[str, str]]) -> str:
         tokenize=False,
         add_generation_prompt=True,
     )
+
 
 def domain_matches(entry_domain: str, domain_filter: str) -> bool:
     if domain_filter.strip().lower() in {"all", "*", ""}:
@@ -156,6 +161,8 @@ def generate_openai(
     args,
     checkpoint_path: str,
 ) -> Dict[int, Any]:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise SystemExit("OPENAI_API_KEY environment variable is required for --provider openai")
     client = OpenAI()
     results: Dict[int, Any] = {}
 
@@ -206,7 +213,11 @@ def generate_openai(
 
 
 def generate_deepseek(messages_list: List[List[Dict[str, str]]], meta: List[Dict[str, Any]], args) -> Dict[int, Any]:
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise SystemExit("DEEPSEEK_API_KEY environment variable is required for --provider deepseek")
+
+    client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
     results: Dict[int, Any] = {}
 
     for msgs, item in tqdm(zip(messages_list, meta), total=len(meta), desc="DeepSeek answering", unit="q"):
@@ -242,7 +253,7 @@ def main() -> None:
         "--model-path",
         type=str,
         default=None,
-        help="Explicit model path for vLLM; overrides default /model-weights/<model>.",
+        help="Explicit model path for vLLM; overrides --model.",
     )
     parser.add_argument(
         "--output",
@@ -266,7 +277,7 @@ def main() -> None:
         "--max-tokens",
         type=int,
         default=1500,
-        help="Max tokens for OpenAI responses (ignored for vLLM).",
+        help="Maximum generated tokens for each victim-model answer.",
     )
     parser.add_argument(
         "--temperature",
